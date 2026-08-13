@@ -1,0 +1,114 @@
+name: uptime
+
+# Off-box liveness check for the MMGlobal platform.
+#
+# WHY THIS EXISTS
+# On 2026-08-12 the platform was down for 15 h 54 min and nothing noticed. Every
+# monitor it had -- core-heartbeat, platform-watchdog.timer, the briefing timers
+# -- runs ON the machine that was off. A monitor that only runs when the thing
+# it monitors is healthy is not a monitor.
+#
+# This one runs on GitHub's infrastructure, so it survives the failure it is
+# watching for. That is the entire point; keep it that way. Do not "simplify"
+# this by moving it onto the host.
+#
+# WHAT IT DOES NOT DO
+# GitHub's scheduler is best-effort: a */10 cron commonly lands 5-15 min late and
+# occasionally skips a slot entirely. Treat detection as "within ~30 min", not
+# ten. That is a poor page but an excellent smoke alarm, which is the gap being
+# filled here.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # solely for the monthly keepalive commit in the last step
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe public endpoints
+        run: |
+          set -uo pipefail
+          fail=0
+
+          {
+            echo "## MMGlobal edge check"
+            echo
+            echo "| Host | Code | State | Expectation |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          probe() {
+            host="$1"; want="$2"; label="$3"; code=000
+            # Three attempts before declaring anything down. cloudflared
+            # reconnects and Cloudflare edge blips both produce a single bad
+            # response; alerting on one sample would cry wolf constantly.
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$host/" 2>/dev/null || echo 000)
+              if [ "$code" = "$want" ]; then
+                echo "| \`$host\` | $code | :white_check_mark: up | $label |" >> "$GITHUB_STEP_SUMMARY"
+                echo "ok   $host -> $code (attempt $attempt)"
+                return 0
+              fi
+              echo "warn $host -> $code, expected $want (attempt $attempt)"
+              if [ "$attempt" -lt 3 ]; then sleep 20; fi
+            done
+            echo "| \`$host\` | $code | :x: **DOWN** | expected $want -- $label |" >> "$GITHUB_STEP_SUMMARY"
+            echo "FAIL $host -> $code after 3 attempts, expected $want"
+            fail=1
+            return 1
+          }
+
+          # 200 = the app is serving. This is the one that proves the whole chain
+          # is alive: Windows logon -> WSL -> systemd -> Docker -> cloudflared.
+          probe chat.mmglobal.us 200 "app-level auth"
+
+          # 302 = Cloudflare Access is still enforcing. A 200 here would mean the
+          # API got exposed, so this check is as much security as liveness.
+          probe api.mmglobal.us 302 "Cloudflare Access MUST stay enforced"
+
+          # 200 = Guacamole is serving its login page.
+          probe desktop.mmglobal.us 200 "password-only, owner-accepted"
+
+          if [ "$fail" -ne 0 ]; then
+            {
+              echo
+              echo "> :rotating_light: One or more endpoints failed three consecutive attempts."
+              echo "> If \`chat\` is down, the mini PC is most likely sitting at the Windows"
+              echo "> login screen -- see \`docs/21-disaster-recovery.md\` section 2 in"
+              echo "> \`system-source-of-truth\`. Nothing on the box can be reached in that"
+              echo "> state, including the remote desktop."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$fail"
+
+      - name: Monthly keepalive commit
+        if: always() && github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          # GitHub disables scheduled workflows after 60 days of repository
+          # inactivity, and workflow RUNS do not count as activity -- only
+          # commits do. Without this the monitor dies silently two months from
+          # now, which is precisely the failure mode it exists to prevent.
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "not the 1st of the month -- skipping keepalive"
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "uptime-bot"
+          git config user.email "uptime-bot@users.noreply.github.com"
+          git add .keepalive
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: keepalive (prevents 60-day scheduled-workflow disable)"
+          git push
